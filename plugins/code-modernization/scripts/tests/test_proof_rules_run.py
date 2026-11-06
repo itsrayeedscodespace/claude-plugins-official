@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(PLUGIN, "scripts"))
 import build_report as br  # noqa: E402
 import proof_pack as pp  # noqa: E402
 import trace_rules as tr  # noqa: E402
-from test_proof_tools import RULES_MD, T0, Ws, junit, load, passing, put, read, run_main  # noqa: E402
+from test_proof_tools import RULES_MD, T0, Ws, junit, load, make_symlink, passing, put, read, run_main  # noqa: E402
 
 SKIPPED_TEST = '''package p;
 
@@ -372,6 +372,134 @@ class TestOnlyFolders(unittest.TestCase):
         result = tr.trace(self.ws.root, "s", {"modernized/s/harness": {"known": True, "ids": set(), "keys": {"harnesstest"}}})
         self.assertEqual({r["id"]: r["status"] for r in result["rules"]}["RULE-003"], "tested")
         self.assertEqual([m["name"] for m in result["modules"]], ["harness", "mod"])
+
+
+E2E_HARNESS = {"package.json": '{"type": "module"}', "run-e2e.sh": "#!/bin/sh\nnode --test *.e2e.mjs\n", "README.md": "how to run the browser tests",
+               "laborant.e2e.mjs": "import { waitFor } from './wait-for.mjs'\n", "device.e2e.mjs": "// RULE-001\n", "field.e2e.ts": "test('field', () => {})\n",
+               "exchange.e2e.mjs": "import { seed } from './seed-users.mjs'\n", "junit.mjs": "export function write() {}\n", "junit.test.mjs": "import './junit.mjs'\n",
+               "load.mjs": "export const load = () => {}\n", "seed-users.mjs": "export const seed = () => {}\n", "wait-for.mjs": "export const waitFor = () => {}\n",
+               "node_modules/pkg/index.js": "module.exports = 1\n"}
+
+
+class JsE2eHarness(unittest.TestCase):
+    """#6915: a JavaScript e2e harness (*.e2e.mjs, *.cy.ts and the helpers only they use) is test tooling; production code beside e2e tests is still judged."""
+
+    def setUp(self):
+        self.ws = RuleWs(self)
+
+    def folder(self, name, files):
+        for rel, text in files.items():
+            put(self.ws.root, "modernized/s/%s/%s" % (name, rel), text, T0 + 20)
+        return os.path.join(self.ws.root, "modernized", "s", name)
+
+    def judged(self):
+        return sorted(m["name"] for m in self.ws.pack()["modules"])
+
+    def test_e2e_and_cypress_names_are_test_files_and_near_misses_are_not(self):
+        for rel in ("laborant.e2e.mjs", "web/login.e2e.ts", "a.e2e.js", "a.e2e.tsx", "cart.cy.js", "web/cart.cy.ts", "Cart.cy.tsx",
+                    "src/FooTest.java", "pkg/test_foo.py", "pkg/foo_test.go", "web/a.spec.ts", "web/a.test.js", "tests/helper.py"):
+            self.assertEqual(tr.file_kind(rel), "test", rel)
+        for rel in ("e2e.mjs", "src/e2e.ts", "src/e2e/wait-for.mjs", "cy.ts", "privacy.ts", "policy.js", "fancy.js", "a.E2E.mjs", "a.e2e.config.ts", "a.cy.config.js", "lib/e2etools.js"):
+            self.assertEqual(tr.file_kind(rel), "main", rel)
+
+    # A, H: the harness from the issue is listed as test tooling, never judged, and gets no gap it could never close
+    def test_a_js_e2e_harness_with_its_helpers_is_listed_not_judged(self):
+        harness = self.folder("e2e", E2E_HARNESS)
+        self.assertTrue(tr.tooling_only(harness))
+        pack = self.ws.pack()
+        self.assertEqual([m["name"] for m in pack["modules"]], ["mod"])
+        self.assertEqual(pack["toolingOnly"], [{"name": "e2e", "track": "rewrite", "path": "modernized/s/e2e"}])
+        self.assertEqual(pack["overall"], {"verdict": "PROVEN", "counts": {"PROVEN": 1, "PARTLY PROVEN": 0, "NOT PROVEN": 0}})
+        code, out, _ = run_main(pp.main, ["s", "--workspace", self.ws.root])
+        self.assertEqual(code, 0)
+        self.assertIn("e2e (rewrite): test tooling, not judged", out)
+        md = read(os.path.join(self.ws.root, "analysis", "s", "VERIFICATION.md"))
+        self.assertIn("\n## Test tooling (not judged)\n", md)
+        self.assertIn("- `modernized/s/e2e` (rewrite)", md)
+        self.assertNotIn("## e2e", md)
+        self.assertNotIn("| e2e |", md)
+        self.assertIn("**Overall: PROVEN** (1 proven)", md)
+        result = tr.trace(self.ws.root, "s")                                           # the trace still reads it: its tests are tests
+        self.assertEqual({m["name"]: m["testFiles"] for m in result["modules"]}["e2e"], 5)
+
+    def test_the_same_harness_under_another_folder_name_is_judged_because_its_helpers_are_code(self):
+        harness = self.folder("browser", E2E_HARNESS)
+        self.assertFalse(tr.tooling_only(harness))
+        self.assertEqual(self.judged(), ["browser", "mod"])
+        for rel in ("junit.mjs", "load.mjs", "seed-users.mjs", "wait-for.mjs", "run-e2e.sh"):     # with only tests and build files left it is tooling
+            os.remove(os.path.join(harness, rel))
+        self.assertTrue(tr.tooling_only(harness))
+
+    # B
+    def test_a_cypress_suite_is_tooling_by_its_file_names(self):
+        suite = self.folder("checkout-ui", {"package.json": "{}", "cypress.config.ts": "export default {}\n", "tsconfig.json": "{}",
+                                            "login.cy.ts": "describe('login', () => {})\n", "cart.cy.js": "describe('cart', () => {})\n"})
+        self.assertTrue(tr.tooling_only(suite))
+        self.assertEqual(self.judged(), ["mod"])
+        self.assertEqual([t["name"] for t in self.ws.pack()["toolingOnly"]], ["checkout-ui"])
+
+    # C
+    def test_test_oracles_in_a_test_folder_are_tooling_and_an_oracle_folder_of_plain_code_is_judged(self):
+        oracle = {"oracle/fee_oracle.py": "def fee(x):\n    return x * 2\n", "oracle/fixtures/in1.json": "[1, 2]", "conftest.py": "",
+                  "test_fees_against_oracle.py": "from oracle.fee_oracle import fee\n"}
+        self.assertTrue(tr.tooling_only(self.folder("tests", oracle)))
+        self.assertEqual(self.judged(), ["mod"])
+        self.assertFalse(tr.tooling_only(self.folder("oracles", oracle)))     # an independent re-implementation looks like product code: no file rule can tell
+        self.assertEqual(self.judged(), ["mod", "oracles"])
+
+    # D
+    def test_production_code_beside_e2e_tests_is_judged(self):
+        layouts = ({"src/app.ts": "export const app = 1\n", "e2e/login.e2e.ts": "test('login', () => {})\n", "e2e/wait-for.mjs": "", "package.json": "{}", "run-e2e.sh": ""},
+                   {"server.mjs": "export default 1\n", "login.e2e.mjs": "", "checkout.cy.ts": "", "package.json": "{}"})
+        for files in layouts:
+            web = self.folder("web", files)
+            self.assertFalse(tr.tooling_only(web), files)
+            self.assertEqual(self.judged(), ["mod", "web"], files)
+            shutil.rmtree(web)
+        self.folder("web", layouts[0])
+        result = tr.trace(self.ws.root, "s")
+        self.assertEqual({m["name"]: (m["files"], m["testFiles"]) for m in result["modules"]}["web"], (5, 1))
+
+    def test_a_test_named_folder_is_only_tooling_from_its_own_files_never_the_whole_system(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        for system in ("tests", "e2e"):                                               # a system called tests with no module folders is one module, judged
+            put(root, "modernized/%s/Calc.java" % system, "class Calc {}\n")
+            put(root, "modernized/%s/CalcTest.java" % system, "class CalcTest {}\n")
+            self.assertFalse(tr.tooling_only(os.path.join(root, "modernized", system)), system)
+        for name in ("tests", "Tests", "test", "spec", "specs", "__tests__", "e2e", "E2E"):
+            path = self.folder(name, {"Calc.java": "class Calc {}\n", "CalcTest.java": "class CalcTest {}\n"})
+            self.assertTrue(tr.tooling_only(path), name)
+            shutil.rmtree(path)
+
+    # E
+    def test_helpers_with_no_test_file_are_judged_even_in_an_e2e_folder(self):
+        helpers = self.folder("e2e", {"package.json": "{}", "run-e2e.sh": "", "wait-for.mjs": "", "seed-users.mjs": "", "junit.mjs": "", "README.md": "soon"})
+        self.assertFalse(tr.tooling_only(helpers))
+        self.assertEqual(self.judged(), ["e2e", "mod"])
+
+    # F
+    def test_conventional_test_tooling_is_still_recognised(self):
+        self.assertTrue(tr.tooling_only(self.folder("harness", {"pom.xml": "<project/>", "src/test/java/HarnessTest.java": "class HarnessTest {}\n",
+                                                                 "src/test/java/Storefront.java": "class Storefront {}\n"})))
+        self.assertTrue(tr.tooling_only(self.folder("pyharness", {"pyproject.toml": "", "test_calc.py": "", "calc_test.go": "", "a.spec.ts": ""})))
+        self.assertEqual(self.judged(), ["mod"])
+
+    # G
+    def test_an_unrecognised_file_outside_a_test_folder_is_never_ignored(self):
+        for rel in ("run-e2e.sh", "wait-for.mjs", "bin.exe", "launch", "deploy.ps1", "fixtures/users.json"):
+            harness = self.folder("harness-js", {"package.json": "{}", "a.e2e.mjs": "", rel: "#!/bin/sh\n"})
+            self.assertFalse(tr.tooling_only(harness), rel)
+            self.assertEqual(self.judged(), ["harness-js", "mod"], rel)
+            shutil.rmtree(harness)
+
+    def test_links_and_build_output_in_an_e2e_folder_are_not_read(self):
+        harness = self.folder("e2e", {"package.json": "{}", "node_modules/x/index.js": "", "dist/app.js": "", ".cache/a.js": ""})
+        self.assertFalse(tr.tooling_only(harness), "build output and hidden folders are not test files")
+        make_symlink(self, os.path.join(self.ws.root, "modernized", "s", "mod", "src", "test", "CalcTest.java"), os.path.join(harness, "linked.e2e.mjs"))
+        self.assertFalse(tr.tooling_only(harness), "a link is never followed, so it is no test file")
+        put(self.ws.root, "modernized/s/e2e/a.e2e.mjs", "", T0 + 20)
+        self.assertTrue(tr.tooling_only(harness))
 
 
 class RuleTracePieces(unittest.TestCase):

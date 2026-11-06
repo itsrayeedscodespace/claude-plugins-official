@@ -30,10 +30,12 @@ describe.skip and @pytest.mark.skip), pending or todo, in any case. A mention sh
 the rule, not that the test is good.
 
 A test is a file under a folder called test, tests, __tests__, spec or specs, or named like
-FooTest.java, FooTests.cs, TestFoo.java, test_foo.py, foo_test.go, foo.spec.ts or foo.test.js.
-Documentation files (.md, .txt, .rst, .adoc) are never code. Symbolic links are never followed.
-A built folder that holds only test files and the files that build them (pom.xml, mvnw, package.json,
-...) is test tooling, not a module: tooling_only() says so.
+FooTest.java, FooTests.cs, TestFoo.java, test_foo.py, foo_test.go, foo.spec.ts, foo.test.js,
+foo.e2e.mjs or foo.cy.ts. Documentation files (.md, .txt, .rst, .adoc) are never code. Symbolic links
+are never followed. A built folder that holds only test files and the files that build them (pom.xml,
+mvnw, package.json, ...) is test tooling, not a module: tooling_only() says so. A module folder that is
+itself called test, tests, __tests__, spec, specs or e2e holds test code throughout, so its helpers and
+scripts are not main code there; it is tooling only when one of its own files is a test.
 Everything read is untrusted text: it is never executed and only shortened, never trusted.
 
 Exit 0 when every P0 rule is "tested", 1 when some are not, 2 when the rules file cannot be read.
@@ -50,7 +52,8 @@ import sys
 SKIP_DIRS = {"target", "build", "dist", "node_modules", "bin", "obj", "__pycache__", "venv"}
 DOC_EXT = {".md", ".markdown", ".rst", ".txt", ".adoc"}
 TEST_DIRS = {"test", "tests", "__tests__", "spec", "specs"}
-TEST_NAME = re.compile(r"^test_|_tests?\.[^.]+$|\.(?:spec|test)\.[^.]+$|(?:Test|Tests|TestCase|IT)\.[^.]+$|^Test[A-Z0-9_]")
+TEST_FOLDERS = TEST_DIRS | {"e2e"}         # a module folder of one of these names holds test code throughout
+TEST_NAME = re.compile(r"^test_|_tests?\.[^.]+$|\.(?:spec|test|e2e|cy)\.[^.]+$|(?:Test|Tests|TestCase|IT)\.[^.]+$|^Test[A-Z0-9_]")
 NOTES_NAMES = ("TRANSFORMATION_NOTES.md", "UPLIFT_NOTES.md")
 TRACKS = (("rewrite", ""), ("uplift", "-uplifted"), ("reimagine", "-reimagined"))
 FILE_CAP, RULES_CAP, NOTES_CAP, LINE_CAP, MAX_FILES, SAMPLES = 2 << 20, 8 << 20, 1 << 20, 4000, 200000, 3
@@ -279,14 +282,18 @@ def is_tooling(name):
 
 def tooling_only(path):
     """True when a built folder holds test code and the files that build or run it, and nothing else that is not a document: at least
-    one test file, no main code. A file this does not recognise counts as main code, so a folder is only left out when it is clear."""
+    one test file, no main code. A file this does not recognise counts as main code, so a folder is only left out when it is clear.
+    A module folder called test, tests, spec, e2e, ... (never the system's own folder under modernized/) is test code throughout: its
+    helpers and scripts are not main code, but one of its files must still be a test by its name or its folder."""
+    path = os.path.normpath(path)
+    test_folder = os.path.basename(path).lower() in TEST_FOLDERS and os.path.basename(os.path.dirname(path)) != "modernized"
     files, _, cut = walk_module(path, MAX_FILES)
     tests = 0
     for rel, _ in files:
         kind = file_kind(rel)
         if kind == "test":
             tests += 1
-        elif kind == "main" and not is_tooling(rel.rsplit("/", 1)[-1]):
+        elif kind == "main" and not test_folder and not is_tooling(rel.rsplit("/", 1)[-1]):
             return False
     return tests > 0 and not cut
 
